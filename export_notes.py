@@ -6,6 +6,7 @@ See README.md for the tested format and compatibility limits.
 """
 # SPDX-License-Identifier: MIT
 import argparse
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 import os
 from pathlib import Path
@@ -279,18 +280,58 @@ def readonly(path):
     return sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
 
 
-def locate_note(title, note_id=None):
+def active_notes(titles=(), note_id=None):
+    query = (
+        'SELECT n.Z_PK, n.ZIDENTIFIER, n.ZTITLE1, COALESCE(f.ZTITLE2, \'\'), '
+        'n.ZCREATIONDATE3, n.ZMODIFICATIONDATE1 '
+        'FROM ZICCLOUDSYNCINGOBJECT n '
+        'JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK=n.ZFOLDER '
+        'WHERE n.ZTITLE1 IS NOT NULL AND COALESCE(n.ZMARKEDFORDELETION,0)=0 '
+        'AND COALESCE(f.ZFOLDERTYPE,0)<>1 '
+        "AND COALESCE(f.ZIDENTIFIER,'') NOT LIKE 'TrashFolder%'"
+    )
+    parameters = []
+    if titles:
+        query += ' AND n.ZTITLE1 IN (' + ','.join('?' for _ in titles) + ')'
+        parameters.extend(titles)
+    if note_id:
+        query += ' AND n.ZIDENTIFIER=?'
+        parameters.append(note_id)
+    query += (' ORDER BY n.ZMODIFICATIONDATE1 DESC, n.ZCREATIONDATE3 DESC, '
+              'n.ZTITLE1 COLLATE NOCASE, f.ZTITLE2, n.ZIDENTIFIER')
     with readonly(NOTES / 'NoteStore.sqlite') as connection:
-        matches = connection.execute(
-            'SELECT n.Z_PK, n.ZIDENTIFIER FROM ZICCLOUDSYNCINGOBJECT n '
-            'JOIN ZICCLOUDSYNCINGOBJECT f ON f.Z_PK=n.ZFOLDER '
-            'WHERE n.ZTITLE1=? AND COALESCE(n.ZMARKEDFORDELETION,0)=0 '
-            'AND COALESCE(f.ZFOLDERTYPE,0)<>1 '
-            "AND COALESCE(f.ZIDENTIFIER,'') NOT LIKE 'TrashFolder%'"
-            + (' AND n.ZIDENTIFIER=?' if note_id else ''),
-            (title, note_id) if note_id else (title,)).fetchall()
-        if len(matches) != 1:
-            raise ValueError('Expected one note named %r; found %d. Use a unique note title or select a specific note with --note-id.' % (title, len(matches)))
+        return connection.execute(query, parameters).fetchall()
+
+
+def print_note_list(titles=()):
+    matches = active_notes(titles)
+    if not matches:
+        print('No matching active notes found.')
+        return
+
+    def cell(value):
+        return value.replace('\t', '\\t').replace('\r', '\\r').replace('\n', '\\n')
+
+    def date(value):
+        if value is None:
+            return '-'
+        timestamp = datetime(2001, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=value)
+        return timestamp.astimezone().strftime('%Y-%m-%d %H:%M %Z')
+
+    rows = [(cell(identifier), cell(folder), date(created), date(updated), cell(title))
+            for _, identifier, title, folder, created, updated in matches]
+    headings = ('NOTE ID', 'FOLDER', 'CREATED (LOCAL)', 'UPDATED (LOCAL)', 'TITLE')
+    widths = [max(len(label), max(len(row[index]) for row in rows))
+              for index, label in enumerate(headings)]
+    for row in [headings] + rows:
+        print('  '.join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
+def locate_note(title, note_id=None):
+    matches = active_notes((title,), note_id)
+    if len(matches) != 1:
+        raise ValueError('Expected one note named %r; found %d. Run --list with the title to find note IDs, then select one with --note-id.' % (title, len(matches)))
+    with readonly(NOTES / 'NoteStore.sqlite') as connection:
         attachments = connection.execute(
             'SELECT ZIDENTIFIER,ZTYPEUTI,ZACCOUNT1 FROM ZICCLOUDSYNCINGOBJECT '
             'WHERE ZNOTE=? AND COALESCE(ZMARKEDFORDELETION,0)=0', (matches[0][0],)).fetchall()
@@ -389,11 +430,25 @@ def export(title, destination, overwrite, note_id=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('notes', nargs='*', help='Exact note titles; quote names containing spaces')
-    parser.add_argument('--output', type=Path, help='Output PDF path for a single note')
-    parser.add_argument('--output-dir', type=Path, default=HERE / 'Exports')
-    parser.add_argument('--overwrite', action='store_true')
-    parser.add_argument('--note-id', help='Exact Notes UUID when titles are duplicated')
+    parser.add_argument('--output', type=Path, help='Choose the PDF filename and location for one note')
+    parser.add_argument('--output-dir', type=Path, default=HERE / 'Exports',
+                        help='Folder for exported PDFs (default: Exports beside the script)')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Allow replacing an existing output PDF; never changes the source note')
+    parser.add_argument('--note-id', help='Select one note UUID from --list; also provide its exact title')
+    parser.add_argument('--list', dest='list_notes', action='store_true',
+                        help='Show active note IDs, folders, created/updated dates, and titles; newest edits first; optionally filter by exact title')
     args = parser.parse_args()
+    if args.list_notes:
+        if args.output or args.note_id or args.overwrite:
+            parser.error('--list cannot be combined with --output, --note-id, or --overwrite')
+        try:
+            print_note_list(args.notes)
+        except (OSError, ValueError, sqlite3.Error) as error:
+            print('ERROR: %s' % error, file=sys.stderr)
+            print('If macOS blocked Notes access, grant Full Disk Access to the app running this command, then quit and reopen that app.', file=sys.stderr)
+            return 1
+        return 0
     titles = args.notes or [input('Apple Notes title: ').strip()]
     if args.note_id and len(titles) != 1:
         parser.error('--note-id requires exactly one note')
