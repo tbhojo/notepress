@@ -62,12 +62,12 @@ pick the right ID for `--note-id`. Listing only reads metadata; it doesn't expor
 
 ## What works so far
 The tested setup is macOS 15.8.2 with modern `com.apple.paper` drawings. Each note
-must contain one pen-only drawing. Colored pen ink, saved transforms, and erasure
-masks are supported. Other macOS versions haven't been verified.
+must contain one drawing. Colored pen ink, saved transforms, erasure masks, and
+unfilled circles/ellipses are supported. Other macOS versions haven't been verified.
 
-Typed text, photos, scans, attached PDFs, multiple drawings, other brushes, and
-older drawing formats aren't supported yet. The exporter stops when it finds an
-unsupported feature rather than quietly leaving it out.
+Typed text, photos, scans, attached PDFs, multiple drawings, other brushes,
+other shapes, and older drawing formats aren't supported yet. The exporter stops
+when it finds an unsupported feature rather than quietly leaving it out.
 
 Pages use US Letter size. Breaks go in gaps where possible; a small overlap keeps
 ink visible when a long diagram crosses a break. The result is a PDF you can

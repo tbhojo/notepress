@@ -11,6 +11,7 @@
 #include <cmath>
 struct OutlinePoint {int64_t x,y; double auxiliary;};
 using Outlines=std::vector<std::vector<OutlinePoint>>;
+struct Ellipse {CGRect frame; double r,g,b,a,width;};
 @interface PKStroke (ReadOnlyOutline)
 -(void*)newOutlinePaths;
 -(BOOL)_isHidden;
@@ -57,26 +58,52 @@ static CGPathRef strokeOutline(PKStroke*s,size_t&vertices){
  delete paths;return p;
 }
 int main(int argc,char**argv){@autoreleasepool{
- if(argc<4||argc>5){fprintf(stderr,"Usage: renderer DRAWING CANVAS_WIDTH OUTPUT_PDF [TITLE]\n");return 2;}
+ if(argc<4||argc>6){fprintf(stderr,"Usage: renderer DRAWING CANVAS_WIDTH OUTPUT_PDF [TITLE [SHAPES_JSON]]\n");return 2;}
  setbuf(stdout,nullptr);
  NSError*err=nil;
  PKDrawing*d=[[PKDrawing alloc]initWithData:[NSData dataWithContentsOfFile:@(argv[1])] error:&err];
  if(!d){NSLog(@"Decode failed %@",err);return 1;}
  if(![PKStroke instancesRespondToSelector:@selector(newOutlinePaths)]||![PKStroke instancesRespondToSelector:@selector(_isHidden)]){fprintf(stderr,"This PencilKit version is unsupported\n");return 1;}
  NSArray<PKStroke*>*strokes=d.strokes;
+ std::vector<Ellipse>shapes;
+ if(argc==6){
+  NSData*data=[NSData dataWithContentsOfFile:@(argv[5])];
+  id items=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:&err]:nil;
+  if(![items isKindOfClass:[NSArray class]]){fprintf(stderr,"Invalid shapes JSON\n");return 1;}
+  for(id item in items){
+   if(![item isKindOfClass:[NSDictionary class]]||![item[@"kind"]isEqual:@"ellipse"]||
+      ![item[@"frame"]isKindOfClass:[NSArray class]]||[item[@"frame"]count]!=4||
+      ![item[@"stroke"]isKindOfClass:[NSArray class]]||[item[@"stroke"]count]!=4){fprintf(stderr,"Unsupported shape\n");return 1;}
+   NSMutableArray*values=[NSMutableArray arrayWithArray:item[@"frame"]];
+   [values addObjectsFromArray:item[@"stroke"]];
+   [values addObject:item[@"width"]?:[NSNull null]];[values addObject:item[@"opacity"]?:[NSNull null]];
+   for(id value in values)if(![value isKindOfClass:[NSNumber class]]||!std::isfinite([value doubleValue])){fprintf(stderr,"Invalid shape value\n");return 1;}
+   double v[10];for(unsigned j=0;j<10;j++)v[j]=[values[j]doubleValue];
+   if(v[2]<=0||v[3]<=0||v[8]<=0||v[4]<0||v[4]>1||v[5]<0||v[5]>1||v[6]<0||v[6]>1||v[7]<0||v[7]>1||v[9]<0||v[9]>1){fprintf(stderr,"Invalid shape geometry or appearance\n");return 1;}
+   shapes.push_back({CGRectMake(v[0],v[1],v[2],v[3]),v[4],v[5],v[6],v[7]*v[9],v[8]});
+  }
+ }
+ std::vector<CGRect>shapeBounds;
+ CGRect documentBounds=d.bounds;
+ for(const auto&shape:shapes){CGRect b=CGRectInset(shape.frame,-shape.width/2,-shape.width/2);shapeBounds.push_back(b);documentBounds=CGRectUnion(documentBounds,b);}
  printf("Loaded %lu strokes\n",strokes.count);
  std::vector<CGRect>bounds;bounds.reserve(strokes.count);
  unsigned hidden=0,masked=0;
  for(PKStroke*s in strokes){bounds.push_back(s.renderBounds);hidden+=s._isHidden;masked+=(s.mask!=nil);}
  double paperWidth=atof(argv[2]);
  if(!(paperWidth>0&&paperWidth<100000)){fprintf(stderr,"Invalid canvas width\n");return 1;}
- NSInteger height=(NSInteger)ceil(CGRectGetMaxY(d.bounds))+3;
+ NSInteger height=(NSInteger)ceil(CGRectGetMaxY(documentBounds))+3;
  if(height<=0||height>10000000){fprintf(stderr,"Unsupported canvas height\n");return 1;}
  std::vector<int>delta(height+2,0),occupied(height+1,0);
  for(size_t i=0;i<strokes.count;i++)if(!strokes[i]._isHidden){
   NSInteger a=std::max<NSInteger>(0,floor(CGRectGetMinY(bounds[i]))-1);
   NSInteger b=std::min<NSInteger>(height,ceil(CGRectGetMaxY(bounds[i]))+1);
   if(b>a){delta[a]++;delta[b]--;}
+ }
+ for(CGRect b:shapeBounds){
+  NSInteger a=std::max<NSInteger>(0,floor(CGRectGetMinY(b))-1);
+  NSInteger end=std::min<NSInteger>(height,ceil(CGRectGetMaxY(b))+1);
+  if(end>a){delta[a]++;delta[end]--;}
  }
  int active=0;for(NSInteger y=0;y<height;y++){active+=delta[y];occupied[y]=active;}
  NSInteger maxHeight=std::max<NSInteger>(100,floor(720*paperWidth/540));
@@ -103,8 +130,9 @@ int main(int argc,char**argv){@autoreleasepool{
   NSInteger visibleB=std::min<NSInteger>(height,b+(b<height&&occupied[b]?16:0));
   [pages addObject:@{@"visible_start":@(visibleA),@"visible_end":@(visibleB)}];
  }
- printf("Visible strokes %lu; erasure masks %u; pages %lu\n",strokes.count-hidden,masked,pages.count);
+ printf("Visible strokes %lu; erasure masks %u; ellipses %zu; pages %lu\n",strokes.count-hidden,masked,shapes.size(),pages.count);
  __block std::vector<bool>covered(strokes.count,false);
+ __block std::vector<bool>shapesCovered(shapes.size(),false);
  CGRect media=CGRectMake(0,0,612,792);
  CFURLRef url=(__bridge CFURLRef)[NSURL fileURLWithPath:@(argv[3])];
  NSDictionary*info=@{(__bridge NSString*)kCGPDFContextTitle:(argc>4?@(argv[4]):@"Apple Notes"),(__bridge NSString*)kCGPDFContextCreator:@"NotePress"};
@@ -117,6 +145,7 @@ int main(int argc,char**argv){@autoreleasepool{
   double end=[page[@"visible_end"]doubleValue];
   double xmin=0,xmax=paperWidth;
   for(size_t i=0;i<strokes.count;i++)if(!strokes[i]._isHidden&&CGRectGetMaxY(bounds[i])>=start&&CGRectGetMinY(bounds[i])<=end){xmin=fmin(xmin,CGRectGetMinX(bounds[i]));xmax=fmax(xmax,CGRectGetMaxX(bounds[i]));}
+  for(CGRect b:shapeBounds)if(CGRectGetMaxY(b)>=start&&CGRectGetMinY(b)<=end){xmin=fmin(xmin,CGRectGetMinX(b));xmax=fmax(xmax,CGRectGetMaxX(b));}
   xmin=floor(xmin)-2;xmax=ceil(xmax)+2;
   double scale=fmin(540/(xmax-xmin),720/(end-start));
   CGPDFContextBeginPage(ctx,nullptr);
@@ -126,6 +155,13 @@ int main(int argc,char**argv){@autoreleasepool{
   CGContextTranslateCTM(ctx,-xmin,-start);
   CGContextClipToRect(ctx,CGRectMake(xmin,start,xmax-xmin,end-start));
   size_t count=0,vertices=0;
+  for(size_t i=0;i<shapes.size();i++){
+   if(CGRectGetMaxY(shapeBounds[i])<start||CGRectGetMinY(shapeBounds[i])>end)continue;
+   const auto&shape=shapes[i];
+   CGContextSetRGBStrokeColor(ctx,shape.r,shape.g,shape.b,shape.a);
+   CGContextSetLineWidth(ctx,shape.width);CGContextStrokeEllipseInRect(ctx,shape.frame);
+   shapesCovered[i]=true;
+  }
   for(size_t i=0;i<strokes.count;i++){
    PKStroke*s=strokes[i];
    if(s._isHidden||CGRectGetMaxY(bounds[i])<start||CGRectGetMinY(bounds[i])>end)continue;
@@ -150,9 +186,10 @@ int main(int argc,char**argv){@autoreleasepool{
  }];
  CGPDFContextClose(ctx);CGContextRelease(ctx);
  for(size_t i=0;i<strokes.count;i++)if(!strokes[i]._isHidden&&!covered[i]){fprintf(stderr,"ERROR: uncovered stroke %zu\n",i);return 1;}
+ for(size_t i=0;i<shapes.size();i++)if(!shapesCovered[i]){fprintf(stderr,"ERROR: uncovered ellipse %zu\n",i);return 1;}
  CGPDFDocumentRef result=CGPDFDocumentCreateWithURL(url);
  if(!result||CGPDFDocumentGetNumberOfPages(result)!=pageNumber){fprintf(stderr,"ERROR: PDF verification failed\n");return 1;}
  CGPDFDocumentRelease(result);
- printf("Verified %u pages and every visible stroke; %zu vector vertices\n",pageNumber,allVertices);
+ printf("Verified %u pages, every visible stroke, and %zu ellipses; %zu vector vertices\n",pageNumber,shapes.size(),allVertices);
  return 0;
 }}

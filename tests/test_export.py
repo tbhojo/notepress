@@ -4,16 +4,96 @@ import gzip
 import contextlib
 import io
 import importlib.util
+import json
 from pathlib import Path
+import re
 import sqlite3
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import zlib
 
 MODULE = Path(__file__).resolve().parents[1] / 'export_notes.py'
 spec = importlib.util.spec_from_file_location('notes_pdf_export', MODULE)
 exporter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exporter)
+
+
+class PaperShapeTests(unittest.TestCase):
+    """Build a small Paper database without copying anyone's drawing data."""
+    def drawing(self, shape_type=1, secondary_name='resizeBehavior'):
+        field = exporter.field
+        register = lambda value: field(1, field(2, value))
+        sequence = lambda key: field(9, field(1, key))
+        def record(items, extra_names=()):
+            names = list(items) + list(extra_names)
+            body = field(1, bytes(range(len(items))))
+            body += b''.join(field(2, value) for value in items.values())
+            return field(1, field(4, body)) + field(6, b''.join(field(2, name.encode()) for name in names))
+        number = lambda value: b'\x11' + struct.pack('<d', value)
+        shape = record({
+            'frame': register(field(4, struct.pack('>4d', 40, 1200, 90, 70))),
+            'strokeColor': register(field(9, field(1, field(4, struct.pack('>4f', .25, .5, 1, 1))))),
+            'strokeWidth': register(number(5)),
+            'type': register(field(12, field(1, shape_type) + field(2, field(14, b'')))),
+            'opacity': register(number(.75)),
+            'secondaryProperties': field(4, field(1, b'\x06') + field(2, register(field(5, 0)))),
+        }, [secondary_name])
+        canvas = record({
+            'bounds': register(field(4, struct.pack('>4d', 0, 0, 768, 1400))),
+            'drawing': register(field(1, b'drawing')),
+            'subelements': sequence(b'ellipse'),
+        })
+        drawing = record({'strokes': field(9, b'')})
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / 'drawing.sqlite3'
+            with sqlite3.connect(database) as connection:
+                connection.execute('CREATE TABLE Reference (Id BLOB, Data BLOB)')
+                connection.executemany('INSERT INTO Reference VALUES (?,?)', [
+                    (b'\xff', field(1, b'canvas')), (b'canvas', canvas),
+                    (b'drawing', drawing), (b'ellipse', shape)])
+            return exporter.PaperDrawing(database)
+
+    def test_separate_ellipse_layer_preserves_geometry_and_appearance(self):
+        drawing = self.drawing()
+        self.assertEqual(drawing.width, 768)
+        self.assertEqual(drawing.leaves, [])
+        self.assertEqual(drawing.shapes, [{'kind': 'ellipse', 'frame': (40, 1200, 90, 70),
+                         'stroke': (.25, .5, 1, 1), 'width': 5, 'opacity': .75}])
+
+    def test_other_shape_variants_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'Unsupported canvas shape'):
+            self.drawing(shape_type=2)
+
+    def test_unknown_secondary_property_is_not_silently_lost(self):
+        with self.assertRaisesRegex(ValueError, 'Unsupported shape secondary property'):
+            self.drawing(secondary_name='unknownAppearance')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'PencilKit requires macOS')
+    def test_native_renderer_draws_shape_beyond_ink_bounds(self):
+        drawing = self.drawing()
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            classic, shapes, pdf = temp / 'empty.drawing', temp / 'shapes.json', temp / 'out.pdf'
+            drawing.save_classic_drawing(classic)
+            # Shape geometry must extend pagination and horizontal bounds even
+            # when there are no pen strokes. No private note data is involved.
+            drawing.shapes[0]['frame'] = (800, 1800, 90, 70)
+            shapes.write_text(json.dumps(drawing.shapes))
+            result = subprocess.run([str(exporter.renderer()), str(classic), str(drawing.width),
+                                     str(pdf), 'Synthetic', str(shapes)],
+                                    capture_output=True, text=True, check=True)
+            self.assertIn('Verified 2 pages, every visible stroke, and 1 ellipses', result.stdout)
+            data = pdf.read_bytes()
+            self.assertEqual(len(re.findall(rb'/Type /Page\b', data)), 2)
+            streams = re.findall(rb'stream\r?\n(.*?)\r?\nendstream', data, re.DOTALL)
+            content = b'\n'.join(zlib.decompress(stream) for stream in streams)
+            self.assertIn(b' c', content)  # ellipse is a vector Bezier path
+            self.assertIn(b' S', content)  # stroked, without a painted fill
+            self.assertNotIn(b'/Subtype /Image', data)
 
 
 class NoteLookupTests(unittest.TestCase):

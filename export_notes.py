@@ -8,6 +8,8 @@ See README.md for the tested format and compatibility limits.
 import argparse
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+import json
+import math
 import os
 from pathlib import Path
 import re
@@ -112,9 +114,10 @@ class PaperDrawing:
         if len(canvas_ids) != 1:
             raise ValueError('Unsupported Paper canvas structure')
         canvas = self.record_fields(canvas_ids[0])
-        # Fail instead of silently excluding images, shapes, or text boxes.
-        if set(canvas) - {'bounds', 'frame', 'drawing'} or 'drawing' not in canvas:
-            raise ValueError('This exporter supports pen-only Paper canvases; this canvas contains other elements')
+        # Unsupported objects must never silently disappear from a successful PDF.
+        if set(canvas) - {'bounds', 'frame', 'drawing', 'subelements'} or 'drawing' not in canvas:
+            raise ValueError('Unsupported canvas elements; this exporter supports pen strokes and unfilled circles/ellipses')
+        self.shapes = self.canvas_shapes(canvas['subelements']) if 'subelements' in canvas else []
         rect = first(canvas['bounds'], 4)
         if len(rect) != 32:
             raise ValueError('Unsupported canvas bounds')
@@ -127,7 +130,7 @@ class PaperDrawing:
             raise ValueError('Unsupported drawing elements')
         roots = self.references(drawing['strokes'])
         self.leaves = [leaf for root in roots for leaf in self.leaf_strokes(root)]
-        if not self.leaves or len(self.leaves) != len(set(self.leaves)):
+        if (not self.leaves and not self.shapes) or len(self.leaves) != len(set(self.leaves)):
             raise ValueError('Empty drawing or unsupported repeated stroke references')
         # Per-instance caches avoid retaining data across batch exports.
         self.metadata = lru_cache(maxsize=None)(self._metadata)
@@ -161,12 +164,61 @@ class PaperDrawing:
             kind = parse(register)[0][0]
             if kind == 1:
                 value = first(first(register, 1), 2)
-            elif kind == 9 and names[index] == 'strokes':
+            elif kind == 9 and names[index] in ('strokes', 'subelements'):
+                value = register
+            elif kind == 4 and names[index] == 'secondaryProperties':
                 value = register
             else:
-                raise ValueError('Unsupported record value')
+                raise ValueError('Unsupported record value for %r (record kind %d)' % (names[index], kind))
             result[names[index]] = value
         return result
+
+    def canvas_shapes(self, collection):
+        shapes = []
+        for key in self.references(collection):
+            record = self.record_fields(key)
+            required = {'frame', 'type', 'strokeColor', 'strokeWidth', 'opacity'}
+            allowed = required | {'secondaryProperties', 'resizeBehavior'}
+            if not required.issubset(record) or set(record) - allowed:
+                raise ValueError('Unsupported canvas object; only unfilled circles/ellipses are supported alongside pen strokes')
+            # Paper encodes the ellipse variant as enum case 1 with an empty tuple.
+            variant = first(record['type'], 12)
+            if parse(variant) != [(1, 0, 1), (2, 2, b'\x72\x00')]:
+                raise ValueError('Unsupported canvas shape; only unfilled circles/ellipses are supported')
+            if 'secondaryProperties' in record:
+                secondary = first(record['secondaryProperties'], 4)
+                names = [value.decode('utf-8') for value in values(first(self.rows[key], 6), 2)]
+                indexes = packed(first(secondary, 1))
+                registers = values(secondary, 2)
+                if len(indexes) != len(registers):
+                    raise ValueError('Unsupported shape secondary properties')
+                for index, register in zip(indexes, registers):
+                    value = first(first(register, 1), 2)
+                    if names[index] != 'resizeBehavior' or parse(value) != [(5, 0, 0)]:
+                        raise ValueError('Unsupported shape secondary property %r' % names[index])
+            if 'resizeBehavior' in record and parse(record['resizeBehavior']) != [(5, 0, 0)]:
+                raise ValueError('Unsupported shape resize behavior')
+
+            def unpack(value, number, fmt, description):
+                raw = first(value, number)
+                if not isinstance(raw, bytes) or len(raw) != struct.calcsize(fmt):
+                    raise ValueError('Unsupported shape ' + description)
+                return struct.unpack(fmt, raw)
+
+            frame = unpack(record['frame'], 4, '>4d', 'frame')
+            color_items = values(first(record['strokeColor'], 9), 1)
+            if len(color_items) != 1:
+                raise ValueError('Unsupported shape color')
+            color = unpack(color_items[0], 4, '>4f', 'color')
+            width = unpack(record['strokeWidth'], 2, '<d', 'stroke width')[0]
+            opacity = unpack(record['opacity'], 2, '<d', 'opacity')[0]
+            if (not all(math.isfinite(value) for value in (*frame, *color, width, opacity))
+                    or frame[2] <= 0 or frame[3] <= 0 or width <= 0
+                    or not all(0 <= value <= 1 for value in (*color, opacity))):
+                raise ValueError('Invalid shape geometry or appearance')
+            shapes.append({'kind': 'ellipse', 'frame': frame, 'stroke': color,
+                           'width': width, 'opacity': opacity})
+        return shapes
 
     def leaf_strokes(self, key, depth=0):
         if depth > 50:
@@ -407,12 +459,17 @@ def export(title, destination, overwrite, note_id=None):
         drawing = PaperDrawing(snapshot)
         classic = temp / 'original-strokes.drawing'
         stats = drawing.save_classic_drawing(classic)
-        print('%s: %d strokes, %d moved strokes, %d erasure masks' %
-              (title, stats['strokes'], stats['transforms'], stats['masks']), flush=True)
+        print('%s: %d strokes, %d moved strokes, %d erasure masks, %d circles/ellipses' %
+              (title, stats['strokes'], stats['transforms'], stats['masks'], len(drawing.shapes)), flush=True)
         # Keep the previous output intact until rendering and coverage checks pass.
         with tempfile.TemporaryDirectory(prefix='.notes-export-', dir=str(destination.parent)) as stage:
             staged = Path(stage) / 'export.pdf'
-            result = subprocess.run([str(renderer()), str(classic), str(drawing.width), str(staged), title],
+            command = [str(renderer()), str(classic), str(drawing.width), str(staged), title]
+            if drawing.shapes:
+                shapes = temp / 'shapes.json'
+                shapes.write_text(json.dumps(drawing.shapes))
+                command.append(str(shapes))
+            result = subprocess.run(command,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if result.returncode:
                 raise RuntimeError('Renderer failed:\n' + result.stderr + result.stdout)
