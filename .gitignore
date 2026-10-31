@@ -1,0 +1,19 @@
+# Built locally for the current Mac
+/renderer
+/build/
+
+# Notes and exports stay on your machine
+/Exports/
+*.pdf
+*.drawing
+*.sqlite
+*.sqlite3
+*.sqlite*
+*.png
+*.zip
+
+# Python and macOS files
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
